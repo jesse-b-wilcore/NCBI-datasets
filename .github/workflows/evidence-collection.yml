@@ -67,6 +67,134 @@ jobs:
         with:
           sarif_file: trivy.sarif
 
+      - name: Write Trivy scan summary
+        if: always()
+        run: |
+          python3 - <<'PYEOF'
+          import json, os, sys
+          from collections import defaultdict
+
+          summary_file = os.environ.get("GITHUB_STEP_SUMMARY", "/dev/stdout")
+
+          try:
+              with open("trivy-results.json") as f:
+                  data = json.load(f)
+          except Exception as e:
+              with open(summary_file, "a") as out:
+                  out.write(f"## Trivy Scan\n\n> Could not parse results: {e}\n")
+              sys.exit(0)
+
+          severity_order = ["CRITICAL", "HIGH", "MEDIUM", "LOW", "UNKNOWN"]
+          severity_emoji = {
+              "CRITICAL": "🔴",
+              "HIGH":     "🟠",
+              "MEDIUM":   "🟡",
+              "LOW":      "🔵",
+              "UNKNOWN":  "⚪",
+          }
+
+          counts = defaultdict(int)
+          findings = []
+
+          for result in data.get("Results", []):
+              target = result.get("Target", "")
+              for vuln in result.get("Vulnerabilities", []):
+                  sev = vuln.get("Severity", "UNKNOWN")
+                  counts[sev] += 1
+                  findings.append({
+                      "sev":     sev,
+                      "id":      vuln.get("VulnerabilityID", ""),
+                      "pkg":     vuln.get("PkgName", ""),
+                      "version": vuln.get("InstalledVersion", ""),
+                      "fixed":   vuln.get("FixedVersion", "—"),
+                      "title":   vuln.get("Title", vuln.get("Description", ""))[:120],
+                      "target":  target,
+                  })
+
+          total = sum(counts.values())
+
+          # Risk level banner
+          if counts["CRITICAL"] > 0:
+              banner = "🔴 **CRITICAL RISK** — immediate remediation required"
+          elif counts["HIGH"] > 0:
+              banner = "🟠 **HIGH RISK** — remediation recommended before production"
+          elif counts["MEDIUM"] > 0:
+              banner = "🟡 **MEDIUM RISK** — review findings and schedule remediation"
+          elif counts["LOW"] > 0:
+              banner = "🔵 **LOW RISK** — informational findings only"
+          else:
+              banner = "✅ **CLEAN** — no vulnerabilities detected"
+
+          lines = [
+              "## 🔍 Trivy Vulnerability Scan",
+              "",
+              f"> {banner}",
+              "",
+          ]
+
+          # Severity summary table
+          if total > 0:
+              lines += [
+                  "### Findings by Severity",
+                  "",
+                  "| Severity | Count |",
+                  "|----------|-------|",
+              ]
+              for sev in severity_order:
+                  if counts[sev]:
+                      emoji = severity_emoji[sev]
+                      lines.append(f"| {emoji} {sev} | {counts[sev]} |")
+              lines += [
+                  f"| **Total** | **{total}** |",
+                  "",
+              ]
+          else:
+              lines += ["No vulnerabilities found.\n"]
+
+          # Critical and High detail table
+          top_findings = [f for f in findings if f["sev"] in ("CRITICAL", "HIGH")]
+          if top_findings:
+              lines += [
+                  "### Critical & High Findings",
+                  "",
+                  "| Severity | CVE | Package | Installed | Fixed In | Summary |",
+                  "|----------|-----|---------|-----------|----------|---------|",
+              ]
+              for f in sorted(top_findings, key=lambda x: severity_order.index(x["sev"]))[:25]:
+                  emoji = severity_emoji[f["sev"]]
+                  cve_link = f"[{f['id']}](https://nvd.nist.gov/vuln/detail/{f['id']})" if f["id"].startswith("CVE-") else f["id"]
+                  lines.append(
+                      f"| {emoji} {f['sev']} | {cve_link} | `{f['pkg']}` "
+                      f"| {f['version']} | {f['fixed']} | {f['title']} |"
+                  )
+              if len(top_findings) > 25:
+                  lines.append(f"\n_...and {len(top_findings) - 25} more. Download the artifact for the full report._")
+              lines.append("")
+
+          # NIST 800-53 callout
+          lines += [
+              "### NIST 800-53 Controls Impacted",
+              "",
+              "| Control | Title | Status |",
+              "|---------|-------|--------|",
+          ]
+          ra5_status = "⚠️ Findings require remediation plan" if total > 0 else "✅ No findings"
+          si2_status = "🔴 Critical/High flaws present" if counts["CRITICAL"] + counts["HIGH"] > 0 else ("⚠️ Medium/Low flaws present" if total > 0 else "✅ No flaws")
+          lines += [
+              f"| RA-5 | Vulnerability Scanning | {ra5_status} |",
+              f"| SI-2 | Flaw Remediation | {si2_status} |",
+              f"| CM-6 | Configuration Settings | {'⚠️ Review findings' if total > 0 else '✅ No findings'} |",
+              "",
+              "_Full control narratives generated by the report Lambda and stored in S3._",
+              "",
+          ]
+
+          with open(summary_file, "a") as out:
+              out.write("\n".join(lines) + "\n")
+
+          print(f"Summary written: {total} findings ({counts['CRITICAL']} critical, {counts['HIGH']} high)")
+          PYEOF
+
       - name: Upload Trivy scan as workflow artifact
         uses: actions/upload-artifact@v4
         if: always()
@@ -293,11 +421,10 @@ jobs:
           | Triggered by | ${{ github.actor }} |
           | Run | [${{ github.run_id }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) |
 
-          ### Artifacts collected
-          - Trivy vulnerability scan (JSON + SARIF)
-          - CycloneDX SBOM
-          - Dependency inventory
-          - Build metadata
+          ### Evidence collected
+          - CycloneDX SBOM → S3
+          - Dependency inventory → S3
+          - Build metadata → S3
 
           ### Reports
           - JSON: \`${{ steps.lambda.outputs.json_report }}\`
