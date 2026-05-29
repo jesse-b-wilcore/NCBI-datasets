@@ -18,6 +18,7 @@ permissions:
 
 env:
   AWS_REGION: us-east-1
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
   collect-evidence:
@@ -38,41 +39,33 @@ jobs:
           echo "sha=${SHA}" >> "$GITHUB_OUTPUT"
           echo "short_sha=${SHA:0:8}" >> "$GITHUB_OUTPUT"
 
-      # ── AWS Authentication (OIDC — no hardcoded keys) ───────────────────────
-      - name: Configure AWS credentials via OIDC
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
-          aws-region: ${{ env.AWS_REGION }}
-          role-session-name: cato-evidence-${{ steps.sha.outputs.short_sha }}
+      # ── Trivy scan (CLI — runs once, outputs JSON + SARIF in one pass) ──────
+      - name: Install Trivy
+        run: |
+          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh \
+            | sh -s -- -b /usr/local/bin
 
-      # ── Trivy Container/Filesystem Scan ─────────────────────────────────────
       - name: Run Trivy vulnerability scan
-        uses: aquasecurity/trivy-action@master
-        with:
-          scan-type: fs
-          scan-ref: .
-          format: json
-          output: trivy-results.json
-          severity: CRITICAL,HIGH,MEDIUM,LOW
-          exit-code: 0  # Don't fail the build; we collect findings for the report
+        run: |
+          trivy fs . \
+            --format json \
+            --output trivy-results.json \
+            --severity CRITICAL,HIGH,MEDIUM,LOW \
+            --exit-code 0
 
-      - name: Upload Trivy SARIF to GitHub Security tab
-        uses: aquasecurity/trivy-action@master
-        with:
-          scan-type: fs
-          scan-ref: .
-          format: sarif
-          output: trivy.sarif
-          exit-code: 0
+          trivy fs . \
+            --format sarif \
+            --output trivy.sarif \
+            --severity CRITICAL,HIGH,MEDIUM,LOW \
+            --exit-code 0
 
-      - name: Upload SARIF results
-        uses: github/codeql-action/upload-sarif@v3
+      - name: Upload SARIF to GitHub Security tab
+        uses: github/codeql-action/upload-sarif@v4
         if: always()
         with:
           sarif_file: trivy.sarif
 
-      - name: Upload Trivy scan results as workflow artifact
+      - name: Upload Trivy scan as workflow artifact
         uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -84,40 +77,40 @@ jobs:
 
       # ── SBOM Generation ─────────────────────────────────────────────────────
       - name: Generate SBOM (CycloneDX)
-        uses: aquasecurity/trivy-action@master
+        run: |
+          trivy fs . \
+            --format cyclonedx \
+            --output sbom.json \
+            --exit-code 0
+
+      # ── AWS Authentication (OIDC — no hardcoded keys) ───────────────────────
+      - name: Configure AWS credentials via OIDC
+        if: secrets.AWS_ROLE_TO_ASSUME != ''
+        uses: aws-actions/configure-aws-credentials@v4
         with:
-          scan-type: fs
-          scan-ref: .
-          format: cyclonedx
-          output: sbom.json
-          exit-code: 0
+          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: cato-evidence-${{ steps.sha.outputs.short_sha }}
 
       # ── Dependency List ──────────────────────────────────────────────────────
       - name: Collect dependency information
-        id: deps
         run: |
           mkdir -p evidence-artifacts
 
-          # Python dependencies
           if [ -f requirements.txt ]; then
             pip install pipdeptree 2>/dev/null || true
             pipdeptree --json > evidence-artifacts/python-deps.json 2>/dev/null || \
               python -m pip list --format=json > evidence-artifacts/python-deps.json 2>/dev/null || true
           fi
 
-          # Node.js dependencies
           if [ -f package.json ]; then
-            if command -v npm &>/dev/null; then
-              npm list --json --all 2>/dev/null > evidence-artifacts/npm-deps.json || true
-            fi
+            npm list --json --all 2>/dev/null > evidence-artifacts/npm-deps.json || true
           fi
 
-          # Go modules
           if [ -f go.mod ]; then
             go list -json -m all 2>/dev/null > evidence-artifacts/go-deps.json || true
           fi
 
-          # Combine into a single JSON
           python3 - <<'PYEOF'
           import json, glob, os
 
@@ -198,6 +191,7 @@ jobs:
 
       # ── Upload to S3 ─────────────────────────────────────────────────────────
       - name: Upload evidence to S3
+        if: secrets.AWS_ROLE_TO_ASSUME != ''
         run: |
           COMMIT_SHA="${{ steps.sha.outputs.sha }}"
           S3_PREFIX="evidence/${COMMIT_SHA}"
@@ -215,14 +209,15 @@ jobs:
             fi
           }
 
-          upload trivy-results.json "${S3_PREFIX}/trivy_scan.json"
-          upload sbom.json          "${S3_PREFIX}/sbom.json"
+          upload trivy-results.json   "${S3_PREFIX}/trivy_scan.json"
+          upload sbom.json            "${S3_PREFIX}/sbom.json"
           upload dependency_list.json "${S3_PREFIX}/dependency_list.json"
-          upload build_log.json     "${S3_PREFIX}/build_log.json"
+          upload build_log.json       "${S3_PREFIX}/build_log.json"
           upload evidence_bundle.json "${S3_PREFIX}/evidence_bundle.json"
 
       # ── Index in DynamoDB ────────────────────────────────────────────────────
       - name: Record evidence index in DynamoDB
+        if: secrets.AWS_ROLE_TO_ASSUME != ''
         run: |
           COMMIT_SHA="${{ steps.sha.outputs.sha }}"
           COLLECTED_AT="${{ steps.bundle.outputs.collected_at }}"
@@ -246,6 +241,7 @@ jobs:
 
       # ── Trigger Report Generator Lambda ──────────────────────────────────────
       - name: Trigger NIST 800-53 narrative generation
+        if: secrets.AWS_ROLE_TO_ASSUME != ''
         id: lambda
         run: |
           COMMIT_SHA="${{ steps.sha.outputs.sha }}"
@@ -265,7 +261,6 @@ jobs:
             echo "::warning::Lambda invocation returned status ${RESPONSE}"
           fi
 
-          # Extract report paths from response
           JSON_REPORT=$(python3 -c "
           import json
           with open('/tmp/lambda_response.json') as f:
