@@ -1,0 +1,308 @@
+name: cATO Evidence Collection
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: [main, master]
+  workflow_dispatch:
+    inputs:
+      commit_sha:
+        description: "Specific commit SHA to collect evidence for (defaults to current)"
+        required: false
+
+permissions:
+  id-token: write   # Required for OIDC authentication to AWS
+  contents: read
+  security-events: write  # Required for uploading SARIF results
+
+env:
+  AWS_REGION: us-east-1
+
+jobs:
+  collect-evidence:
+    name: Collect Security Evidence
+    runs-on: ubuntu-latest
+
+    steps:
+      # ── Checkout ────────────────────────────────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set evidence commit SHA
+        id: sha
+        run: |
+          SHA="${{ github.event.inputs.commit_sha || github.sha }}"
+          echo "sha=${SHA}" >> "$GITHUB_OUTPUT"
+          echo "short_sha=${SHA:0:8}" >> "$GITHUB_OUTPUT"
+
+      # ── AWS Authentication (OIDC — no hardcoded keys) ───────────────────────
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: cato-evidence-${{ steps.sha.outputs.short_sha }}
+
+      # ── Trivy Container/Filesystem Scan ─────────────────────────────────────
+      - name: Run Trivy vulnerability scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: fs
+          scan-ref: .
+          format: json
+          output: trivy-results.json
+          severity: CRITICAL,HIGH,MEDIUM,LOW
+          exit-code: 0  # Don't fail the build; we collect findings for the report
+
+      - name: Upload Trivy SARIF to GitHub Security tab
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: fs
+          scan-ref: .
+          format: sarif
+          output: trivy.sarif
+          exit-code: 0
+
+      - name: Upload SARIF results
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: trivy.sarif
+
+      - name: Upload Trivy scan results as workflow artifact
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: trivy-scan-${{ steps.sha.outputs.short_sha }}
+          path: |
+            trivy-results.json
+            trivy.sarif
+          retention-days: 90
+
+      # ── SBOM Generation ─────────────────────────────────────────────────────
+      - name: Generate SBOM (CycloneDX)
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: fs
+          scan-ref: .
+          format: cyclonedx
+          output: sbom.json
+          exit-code: 0
+
+      # ── Dependency List ──────────────────────────────────────────────────────
+      - name: Collect dependency information
+        id: deps
+        run: |
+          mkdir -p evidence-artifacts
+
+          # Python dependencies
+          if [ -f requirements.txt ]; then
+            pip install pipdeptree 2>/dev/null || true
+            pipdeptree --json > evidence-artifacts/python-deps.json 2>/dev/null || \
+              python -m pip list --format=json > evidence-artifacts/python-deps.json 2>/dev/null || true
+          fi
+
+          # Node.js dependencies
+          if [ -f package.json ]; then
+            if command -v npm &>/dev/null; then
+              npm list --json --all 2>/dev/null > evidence-artifacts/npm-deps.json || true
+            fi
+          fi
+
+          # Go modules
+          if [ -f go.mod ]; then
+            go list -json -m all 2>/dev/null > evidence-artifacts/go-deps.json || true
+          fi
+
+          # Combine into a single JSON
+          python3 - <<'PYEOF'
+          import json, glob, os
+
+          combined = {}
+          for f in glob.glob("evidence-artifacts/*-deps.json"):
+              key = os.path.basename(f).replace("-deps.json", "")
+              try:
+                  with open(f) as fh:
+                      combined[key] = json.load(fh)
+              except Exception:
+                  pass
+
+          with open("dependency_list.json", "w") as out:
+              json.dump(combined, out, indent=2)
+          PYEOF
+
+      # ── Build Metadata ───────────────────────────────────────────────────────
+      - name: Collect build metadata
+        run: |
+          python3 - <<'PYEOF'
+          import json, os, subprocess
+          from datetime import datetime, timezone
+
+          def run(cmd):
+              try:
+                  return subprocess.check_output(cmd, shell=True, text=True).strip()
+              except Exception:
+                  return ""
+
+          meta = {
+              "commit_sha": os.environ.get("GITHUB_SHA", ""),
+              "ref": os.environ.get("GITHUB_REF", ""),
+              "actor": os.environ.get("GITHUB_ACTOR", ""),
+              "repository": os.environ.get("GITHUB_REPOSITORY", ""),
+              "run_id": os.environ.get("GITHUB_RUN_ID", ""),
+              "run_number": os.environ.get("GITHUB_RUN_NUMBER", ""),
+              "workflow": os.environ.get("GITHUB_WORKFLOW", ""),
+              "collected_at": datetime.now(timezone.utc).isoformat(),
+              "runner_os": os.environ.get("RUNNER_OS", ""),
+              "git_log": run("git log --oneline -10"),
+              "changed_files": run("git diff --name-only HEAD~1 HEAD 2>/dev/null || echo ''"),
+          }
+
+          with open("build_log.json", "w") as out:
+              json.dump(meta, out, indent=2)
+          PYEOF
+
+      # ── Package Evidence Bundle ──────────────────────────────────────────────
+      - name: Package evidence bundle
+        id: bundle
+        run: |
+          COMMIT_SHA="${{ steps.sha.outputs.sha }}"
+          COLLECTED_AT=$(date -u +%Y%m%dT%H%M%SZ)
+
+          python3 - <<PYEOF
+          import json
+          from datetime import datetime, timezone
+
+          bundle = {
+              "schema_version": "1.0",
+              "commit_sha": "${COMMIT_SHA}",
+              "collected_at": datetime.now(timezone.utc).isoformat(),
+              "workflow_run_id": "${{ github.run_id }}",
+              "repository": "${{ github.repository }}",
+              "artifacts": {
+                  "trivy_scan": "trivy_scan.json",
+                  "sbom": "sbom.json",
+                  "dependency_list": "dependency_list.json",
+                  "build_log": "build_log.json",
+              }
+          }
+
+          with open("evidence_bundle.json", "w") as f:
+              json.dump(bundle, f, indent=2)
+          PYEOF
+
+          echo "collected_at=${COLLECTED_AT}" >> "$GITHUB_OUTPUT"
+
+      # ── Upload to S3 ─────────────────────────────────────────────────────────
+      - name: Upload evidence to S3
+        run: |
+          COMMIT_SHA="${{ steps.sha.outputs.sha }}"
+          S3_PREFIX="evidence/${COMMIT_SHA}"
+
+          upload() {
+            local file="$1"
+            local key="$2"
+            if [ -f "$file" ]; then
+              aws s3 cp "$file" "s3://${{ secrets.EVIDENCE_BUCKET }}/${key}" \
+                --server-side-encryption AES256 \
+                --metadata "commit_sha=${COMMIT_SHA},workflow_run=${{ github.run_id }}"
+              echo "Uploaded $file → s3://${{ secrets.EVIDENCE_BUCKET }}/${key}"
+            else
+              echo "Skipping $file (not found)"
+            fi
+          }
+
+          upload trivy-results.json "${S3_PREFIX}/trivy_scan.json"
+          upload sbom.json          "${S3_PREFIX}/sbom.json"
+          upload dependency_list.json "${S3_PREFIX}/dependency_list.json"
+          upload build_log.json     "${S3_PREFIX}/build_log.json"
+          upload evidence_bundle.json "${S3_PREFIX}/evidence_bundle.json"
+
+      # ── Index in DynamoDB ────────────────────────────────────────────────────
+      - name: Record evidence index in DynamoDB
+        run: |
+          COMMIT_SHA="${{ steps.sha.outputs.sha }}"
+          COLLECTED_AT="${{ steps.bundle.outputs.collected_at }}"
+
+          aws dynamodb put-item \
+            --table-name "${{ secrets.EVIDENCE_DYNAMO_TABLE }}" \
+            --item "$(python3 -c "
+          import json
+          item = {
+            'commit_sha':    {'S': '${COMMIT_SHA}'},
+            'evidence_type': {'S': 'collection_run'},
+            'collected_at':  {'S': '${COLLECTED_AT}'},
+            'repository':    {'S': '${{ github.repository }}'},
+            'workflow_run':  {'S': '${{ github.run_id }}'},
+            'ref':           {'S': '${{ github.ref }}'},
+            'actor':         {'S': '${{ github.actor }}'},
+            'artifacts':     {'SS': ['trivy_scan', 'sbom', 'dependency_list', 'build_log']},
+          }
+          print(json.dumps(item))
+          ")"
+
+      # ── Trigger Report Generator Lambda ──────────────────────────────────────
+      - name: Trigger NIST 800-53 narrative generation
+        id: lambda
+        run: |
+          COMMIT_SHA="${{ steps.sha.outputs.sha }}"
+
+          RESPONSE=$(aws lambda invoke \
+            --function-name "${{ secrets.REPORT_LAMBDA_NAME }}" \
+            --payload "$(echo "{\"commit_sha\":\"${COMMIT_SHA}\"}" | base64)" \
+            --cli-binary-format raw-in-base64-out \
+            /tmp/lambda_response.json \
+            --query 'StatusCode' \
+            --output text)
+
+          echo "Lambda invocation status: ${RESPONSE}"
+          cat /tmp/lambda_response.json
+
+          if [ "${RESPONSE}" != "200" ]; then
+            echo "::warning::Lambda invocation returned status ${RESPONSE}"
+          fi
+
+          # Extract report paths from response
+          JSON_REPORT=$(python3 -c "
+          import json
+          with open('/tmp/lambda_response.json') as f:
+              r = json.load(f)
+          print(r.get('json_report', 'not available'))
+          ")
+          MARKDOWN_REPORT=$(python3 -c "
+          import json
+          with open('/tmp/lambda_response.json') as f:
+              r = json.load(f)
+          print(r.get('markdown_report', 'not available'))
+          ")
+
+          echo "json_report=${JSON_REPORT}" >> "$GITHUB_OUTPUT"
+          echo "markdown_report=${MARKDOWN_REPORT}" >> "$GITHUB_OUTPUT"
+
+      # ── Summary ──────────────────────────────────────────────────────────────
+      - name: Write job summary
+        if: always()
+        run: |
+          cat >> "$GITHUB_STEP_SUMMARY" <<SUMMARY
+          ## cATO Evidence Collection
+
+          | Field | Value |
+          |-------|-------|
+          | Commit | \`${{ steps.sha.outputs.sha }}\` |
+          | Repository | ${{ github.repository }} |
+          | Triggered by | ${{ github.actor }} |
+          | Run | [${{ github.run_id }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) |
+
+          ### Artifacts collected
+          - Trivy vulnerability scan (JSON + SARIF)
+          - CycloneDX SBOM
+          - Dependency inventory
+          - Build metadata
+
+          ### Reports
+          - JSON: \`${{ steps.lambda.outputs.json_report }}\`
+          - Markdown: \`${{ steps.lambda.outputs.markdown_report }}\`
+          SUMMARY
