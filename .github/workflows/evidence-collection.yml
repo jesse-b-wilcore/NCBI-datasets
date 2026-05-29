@@ -24,6 +24,8 @@ jobs:
   collect-evidence:
     name: Collect Security Evidence
     runs-on: ubuntu-latest
+    env:
+      AWS_ROLE_TO_ASSUME: ${{ secrets.AWS_ROLE_TO_ASSUME }}
 
     steps:
       # ── Checkout ────────────────────────────────────────────────────────────
@@ -85,7 +87,7 @@ jobs:
 
       # ── AWS Authentication (OIDC — no hardcoded keys) ───────────────────────
       - name: Configure AWS credentials via OIDC
-        if: secrets.AWS_ROLE_TO_ASSUME != ''
+        if: env.AWS_ROLE_TO_ASSUME != ''
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
@@ -191,7 +193,7 @@ jobs:
 
       # ── Upload to S3 ─────────────────────────────────────────────────────────
       - name: Upload evidence to S3
-        if: secrets.AWS_ROLE_TO_ASSUME != ''
+        if: env.AWS_ROLE_TO_ASSUME != ''
         run: |
           COMMIT_SHA="${{ steps.sha.outputs.sha }}"
           S3_PREFIX="evidence/${COMMIT_SHA}"
@@ -217,7 +219,7 @@ jobs:
 
       # ── Index in DynamoDB ────────────────────────────────────────────────────
       - name: Record evidence index in DynamoDB
-        if: secrets.AWS_ROLE_TO_ASSUME != ''
+        if: env.AWS_ROLE_TO_ASSUME != ''
         run: |
           COMMIT_SHA="${{ steps.sha.outputs.sha }}"
           COLLECTED_AT="${{ steps.bundle.outputs.collected_at }}"
@@ -241,7 +243,7 @@ jobs:
 
       # ── Trigger Report Generator Lambda ──────────────────────────────────────
       - name: Trigger NIST 800-53 narrative generation
-        if: secrets.AWS_ROLE_TO_ASSUME != ''
+        if: env.AWS_ROLE_TO_ASSUME != ''
         id: lambda
         run: |
           COMMIT_SHA="${{ steps.sha.outputs.sha }}"
